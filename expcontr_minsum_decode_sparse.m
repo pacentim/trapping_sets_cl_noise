@@ -1,0 +1,239 @@
+function [hard_bits, success, iters, Lpost_out, state] = expcontr_minsum_decode_sparse(H, syndrome, priors, cfg, dv_ext, state)
+%EXP CONTR MIN-SUM (sparse H)
+% Flooding min-sum on sparse parity-check matrix H (M x N), with degree-1 CN injection.
+%
+% Inputs:
+%   H        : sparse logical/double matrix (M x N), entries in {0,1}
+%   syndrome : (M x 1) or (1 x M) binary
+%   priors   : (N x 1) or (1 x N) LLRs
+%   cfg      : struct with fields:
+%              - max_iter (default 50)
+%              - saturation (default 25)
+%              - beta_code (default 1)
+%   dv_ext   : scalar or (M x 1) vector, used only for degree-1 CN injection
+%   state    : optional cached precomputation (recommended for speed)
+%
+% Outputs:
+%   hard_bits : (N x 1) uint8
+%   success   : logical
+%   iters     : number of iterations run
+%   Lpost_out : (N x 1) double
+%   state     : cached structure for reuse with same H
+
+    if nargin < 4 || isempty(cfg), cfg = struct(); end
+    if ~isfield(cfg,'max_iter'),   cfg.max_iter = 50; end
+    if ~isfield(cfg,'saturation'), cfg.saturation = 50.0; end
+    if ~isfield(cfg,'beta_code'),  cfg.beta_code = 1.0; end
+
+    if nargin < 5 || isempty(dv_ext)
+        error('Provide dv_ext (scalar or length-M vector) for degree-1 CN injection.');
+    end
+
+    % Ensure H is sparse logical for fast indexing
+    if ~issparse(H), H = sparse(H); end
+    H = spones(H) ~= 0;
+
+    [M, N] = size(H);
+    syndrome = uint8(syndrome(:) ~= 0);
+    priors   = double(priors(:));
+
+    if numel(syndrome) ~= M, error('Syndrome size mismatch.'); end
+    if numel(priors)   ~= N, error('Priors size mismatch.'); end
+
+    sat = cfg.saturation;
+    beta = cfg.beta_code;
+
+    % Normalize dv_ext
+    if isscalar(dv_ext)
+        dv_mode = 0;
+        dv_scalar = double(dv_ext);
+    else
+        dv_mode = 1;
+        dv_vec = double(dv_ext(:));
+        if numel(dv_vec) ~= M
+            error('dv_ext vector must have length M.');
+        end
+    end
+
+    % Build / reuse edge structure
+    if nargin < 6 || isempty(state) || ~isfield(state,'M') || state.M ~= M || state.N ~= N
+        state = build_edge_state(H);
+    end
+
+    E = state.E;
+    ci = state.ci;  % (E x 1) check index per edge
+    vj = state.vj;  % (E x 1) var index per edge
+
+    % Messages on edges
+    v2c = zeros(E,1);
+    c2v = zeros(E,1);
+
+    % Initialize v2c: prior replicated on each incident edge
+    v2c = priors(vj);
+    v2c = saturate_vec(v2c, sat);
+
+    hard_bits = zeros(N,1,'uint8');
+    Lpost_out = zeros(N,1);
+    success = false;
+
+    % Theta recursion state
+    Y = priors(1);
+    if dv_mode == 0
+        theta_scalar = saturate_scalar(Y, sat);  % theta^(0)
+    else
+        theta_vec = saturate_vec(Y * ones(M,1), sat); % theta^(0) per check
+    end
+
+    for iter = 1:cfg.max_iter
+
+        % Update theta for iter >= 2 (your convention: iter=1 uses theta^(0))
+        if iter >= 2
+            if dv_mode == 0
+                theta_scalar = saturate_scalar(Y + (dv_scalar-1) * theta_scalar, sat);
+            else
+                theta_vec = saturate_vec(Y + (dv_vec-1) .* theta_vec, sat);
+            end
+        end
+
+        % =========================
+        % (1) CN update
+        % =========================
+        % Process checks one by one using edge ranges (no cell arrays)
+        for c = 1:M
+            e1 = state.c_ptr(c);
+            e2 = state.c_ptr(c+1) - 1;
+            if e2 < e1, continue; end
+            d = e2 - e1 + 1;
+
+            if d == 1
+                % Degree-1 CN injection only
+                if dv_mode == 0
+                    mag = theta_scalar;
+                else
+                    mag = theta_vec(c);
+                end
+                s = 1 - 2*double(syndrome(c)); % +1 if syn=0, -1 if syn=1
+                c2v(e1) = saturate_scalar(s * mag * beta, sat);
+                continue;
+            end
+
+            edges = e1:e2;
+            msgs = v2c(edges);
+            abs_msgs = abs(msgs);
+
+            % min1, min2
+            [min1, idxMin] = min(abs_msgs);
+            min2 = min(abs_msgs([1:idxMin-1, idxMin+1:end]));
+
+            % sign product: parity of negatives
+            negParity = mod(nnz(msgs < 0), 2);
+            if syndrome(c) ~= 0
+                negParity = 1 - negParity;
+            end
+            % overall sign = (-1)^(negParity)
+            overallSign = 1 - 2*double(negParity);
+
+            % For each edge: out_sign = overallSign * sign(msg_k)
+            % sign(msg_k) is -1 if msg_k < 0 else +1
+            sgnk = ones(d,1);
+            sgnk(msgs < 0) = -1;
+
+            % Magnitudes: min1 except on idxMin where min2
+            mags = min1 * ones(d,1);
+            mags(idxMin) = min2;
+
+            c2v(edges) = saturate_vec((overallSign .* sgnk) .* (mags * beta), sat);
+        end
+
+        % =========================
+        % (2) VN update
+        % =========================
+        % Compute Lpost = priors + sum_{c in N(v)} c2v
+        sum_c2v = accumarray(vj, c2v, [N 1], @sum, 0.0);
+        Lpost = priors + sum_c2v;
+
+        % v2c(e) = Lpost(v) - c2v(e)
+        v2c = saturate_vec(Lpost(vj) - c2v, sat);
+
+        % =========================
+        % (3) Hard decision + syndrome check
+        % =========================
+        Lpost_out = Lpost;
+        hard_bits = uint8(Lpost < 0);
+
+        if syndrome_check_edges(state, hard_bits, syndrome)
+            success = true;
+            iters = iter;
+            state.v2c = v2c; %#ok<STRNU> optional return
+            state.c2v = c2v;
+            return;
+        end
+    end
+
+    iters = cfg.max_iter;
+    state.v2c = v2c;
+    state.c2v = c2v;
+end
+
+% ---------- Helpers ----------
+
+function state = build_edge_state(H)
+    [ci, vj] = find(H);   % edge list
+    ci = uint32(ci);
+    vj = uint32(vj);
+    E = numel(ci);
+
+    % Sort edges by check for fast CN ranges
+    [ci, permC] = sort(ci);
+    vjC = vj(permC);
+
+    % Build c_ptr: pointers into edge array for each check
+    M = size(H,1);
+    c_ptr = zeros(M+1,1,'uint32');
+    % counts per check
+    dc = accumarray(double(ci), 1, [M 1], @sum, 0);
+    c_ptr(1) = 1;
+    c_ptr(2:end) = uint32(1 + cumsum(dc));
+
+    % For VN update we need vj per edge in the same order as messages live.
+    % We'll keep edges ordered by check for CN update; VN update uses accumarray(vj,...).
+    state.M = M;
+    state.N = size(H,2);
+    state.E = E;
+    state.ci = ci;
+    state.vj = vjC;
+    state.c_ptr = c_ptr;
+end
+
+function y = saturate_vec(x, limit)
+    y = min(max(x, -limit), limit);
+end
+
+function y = saturate_scalar(x, limit)
+    if x > limit, y = limit;
+    elseif x < -limit, y = -limit;
+    else, y = x;
+    end
+end
+
+function ok = syndrome_check_edges(state, hard_bits, syndrome)
+    M = state.M;
+    ok = true;
+    for c = 1:M
+        e1 = state.c_ptr(c);
+        e2 = state.c_ptr(c+1) - 1;
+        if e2 < e1
+            if syndrome(c) ~= 0, ok = false; return; end
+            continue;
+        end
+        vs = state.vj(e1:e2);
+        parity = uint8(0);
+        for kk = 1:numel(vs)
+            parity = bitxor(parity, hard_bits(vs(kk)));
+        end
+        if parity ~= syndrome(c)
+            ok = false;
+            return;
+        end
+    end
+end
