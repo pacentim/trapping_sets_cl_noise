@@ -14,8 +14,8 @@ strength = [];
 critical = [];
 out_k = 0;
 keys = repVN_by_class.keys;
-% llrs = [L * ones(1,990) zeros(1,size(H,2)-990)];
-% T = build_tanner_graph(H);
+llrs = [L * ones(1,990) zeros(1,size(H,2)-990)];
+T = build_tanner_graph(H);
 
 for k = 1:length(repVN_by_class)
     if out_k==2
@@ -31,11 +31,10 @@ for k = 1:length(repVN_by_class)
     dv = full(sum(subH, 1)).';       % n x 1
     dv_vec = full(subH * (dv - 1));  % M x 1
 
-    llrs = L * ones(1, numel(supp));
-    llrs(supp>990) = 0;
+    % llrs = L * ones(1, numel(supp));
 
-    M = size(subH,1);
-    % M = size(fullsubH,1);
+    % M = size(subH,1);
+    M = size(fullsubH,1);
     n = size(subH,2);
 
     % Union bitset of failing indices (local 1..n)
@@ -60,7 +59,7 @@ for k = 1:length(repVN_by_class)
         syn(:) = false;
         for t = 1:numel(S)
             % syn = xor(syn, fullsubH(:, S(t)));
-            syn = xor(syn, subH(:, S(t)));
+            syn = xor(syn, fullsubH(:, S(t)));
         end
 
         syndrome = double(syn).';

@@ -42,8 +42,6 @@ function [hard_bits, success, iters, Lpost_out, state] = expcontr_minsum_decode_
 
     sat = cfg.saturation;
     beta = cfg.beta_code;
-    p = 1e-3;
-    L = log((1-p)/p);
 
     % Normalize dv_ext
     if isscalar(dv_ext)
@@ -78,28 +76,22 @@ function [hard_bits, success, iters, Lpost_out, state] = expcontr_minsum_decode_
     Lpost_out = zeros(N,1);
     success = false;
 
-    % Theta recursion state (FIXED)
-    theta = zeros(M,1);
-    deg1 = state.deg1_checks;
-    if ~isempty(deg1)
-        % v_of_c = double(state.deg1_v(deg1));
-        theta(deg1) = L;   % theta^(0) = Y_c
-        theta = saturate_vec(theta, sat);
+    % Theta recursion state
+    Y = priors(1);
+    if dv_mode == 0
+        theta_scalar = saturate_scalar(Y, sat);  % theta^(0)
+    else
+        theta_vec = saturate_vec(Y * ones(M,1), sat); % theta^(0) per check
     end
-
 
     for iter = 1:cfg.max_iter
 
         % Update theta for iter >= 2 (your convention: iter=1 uses theta^(0))
-        if iter >= 2 && ~isempty(state.deg1_checks)
-            deg1 = state.deg1_checks;
-            v_of_c = double(state.deg1_v(deg1));
-            Yc = priors(v_of_c);  % per-check prior
-
+        if iter >= 2
             if dv_mode == 0
-                theta(deg1) = saturate_vec(Yc + (dv_scalar-1) .* theta(deg1), sat);
+                theta_scalar = saturate_scalar(Y + (dv_scalar-1) * theta_scalar, sat);
             else
-                theta(deg1) = saturate_vec(Yc + (dv_vec(deg1)-1) .* theta(deg1), sat);
+                theta_vec = saturate_vec(Y + (dv_vec-1) .* theta_vec, sat);
             end
         end
 
@@ -114,8 +106,13 @@ function [hard_bits, success, iters, Lpost_out, state] = expcontr_minsum_decode_
             d = e2 - e1 + 1;
 
             if d == 1
-                mag = theta(c);  % FIXED
-                s = 1 - 2*double(syndrome(c));
+                % Degree-1 CN injection only
+                if dv_mode == 0
+                    mag = theta_scalar;
+                else
+                    mag = theta_vec(c);
+                end
+                s = 1 - 2*double(syndrome(c)); % +1 if syn=0, -1 if syn=1
                 c2v(e1) = saturate_scalar(s * mag * beta, sat);
                 continue;
             end
