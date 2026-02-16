@@ -1,21 +1,63 @@
-function [hard_bits, success, iters, Lpost_out, state] = super_layered_decode_faid(G, layers, syndrome, priors, cfg, state)
+function [hard_bits, success, iters, Lpost_out, state] = super_layered_decode_faid(G, layers, syndrome, priors, cfg, state, lut)
 %SUPER_LAYERED_DECODE_FAID Layered FAID decoder with 3-bit (7-level) messages.
 %
 % Alphabet: {-3,-2,-1,0,1,2,3} (stored as int8)
 %
 % CN update: quantized min-sum (layered)
-% VN update: FAID LUT for dv=2 and dv=3 (fallback to quantized sum for other dv)
+% VN update: FAID LUT for dv=2 and dv=3
 %
-% You will implement LUT2/LUT3 later (placeholders included).
-
-
+% Optional input "lut":
+%   - If omitted or empty: uses built-in default LUTs.
+%   - If provided: struct with fields (any subset allowed)
+%       lut.LUT2neg : int8(1x7)  dv=2 canonical table for y<0, indexed by m=-3..3
+%       lut.LUT3neg : int8(7x7)  dv=3 canonical table for y<0, indexed by m1,m2=-3..3
+%
+% Symmetry convention (as in your dv=3):
+%   if y<0:  out = LUTneg(m,...) 
+%   if y>0:  out = -LUTneg(-m,...)
 
     % -------- defaults --------
     if nargin < 5 || isempty(cfg), cfg = struct(); end
     cfg = apply_superlayered_defaults(cfg);
 
-    M = G.M; N = G.N;
+    % -------- lut defaults --------
+    if nargin < 7 || isempty(lut)
+        lut = struct();
+    end
+    if ~isfield(lut,'LUT2neg') || isempty(lut.LUT2neg)
+        % Default dv=2: linear rule Q(y+m) implemented as a LUT for canonical y<0.
+        % For dv=2, table is indexed only by m; y is handled by symmetry and/or direct addition outside the LUT.
+        % Here we set it to the identity (out = m) for y<0 canonical, and symmetry will handle y>0.
+        % If you prefer a different "standard", replace this vector.
+        lut.LUT2neg = int8([-3 -2 -1 0 1 2 3]);
+    else
+        lut.LUT2neg = int8(lut.LUT2neg(:)).'; % force row
+    end
+    if numel(lut.LUT2neg) ~= 7
+        error('lut.LUT2neg must be 1x7 (or 7x1) int8 for m=-3..3.');
+    end
 
+    if ~isfield(lut,'LUT3neg') || isempty(lut.LUT3neg)
+        % Default dv=3 LUT (your current one), canonical for y<0.
+        lut.LUT3neg = int8([ ...
+            -3 -3 -3 -3 -3 -3 -1;
+            -3 -3 -3 -3 -2 -1  1;
+            -3 -3 -2 -2 -1 -1  1;
+            -3 -3 -2 -1  0  0  1;
+            -3 -2 -1  0  0  1  2;
+            -3 -1 -1  0  1  1  3;
+            -1  1  1  1  2  3  3
+        ]);
+       % lut.LUT3neg = int8([ -3 -3 -3 -3 -3 -2 -1; -3 -3 -3 -3 -2 -1 0; -3 -3 -3 -2 -1 0 1; -3 -3 -2 -1 0 1 2; -3 -2 -1 0 1 2 3; -2 -1 0 1 2 3 3;  -1 0 1 2 3 3 3 ]);
+    else
+        lut.LUT3neg = int8(lut.LUT3neg);
+    end
+    if ~isequal(size(lut.LUT3neg), [7 7])
+        error('lut.LUT3neg must be 7x7 int8 indexed by m1,m2=-3..3.');
+    end
+
+    % -------- basic checks --------
+    M = G.M; N = G.N;
     syndrome = syndrome(:);
     priors   = priors(:);
 
@@ -53,45 +95,14 @@ function [hard_bits, success, iters, Lpost_out, state] = super_layered_decode_fa
 
     layer_max_residual = zeros(L,1);
 
-    % =======================
-    % FAID tables (PLACEHOLDER)
-    % =======================
-    % Convention:
-    %   levels = [-3 -2 -1 0 1 2 3]
-    %   indices use off = 4 so that idx = val + off maps:
-    %      -3->1, -2->2, -1->3, 0->4, 1->5, 2->6, 3->7
-    %
-    % LUT2: out = f(y, m)            where dv=2, m is the OTHER incoming c2v (excluding target edge)
-    % LUT3: out = f(y, m1, m2)       where dv=3, (m1,m2) are the two OTHER incoming c2v
-    %
-    % Fill these later with your optimized FAID rule.
     levels = int8(-3:3);
-    off    = int8(4);
-
-    % dv = 2 (one incoming message): vector
-    % LUT2neg(i) = Φv(-C, Mi)   where Mi is the incoming message level
-    levels = int8(-3:3);
-
-
-    LUT3 = int8([ ...
-        -3 -3 -3 -3 -3 -3 -1;  % m1=-L3:  -L3 -L3 -L3 -L3 -L3 -L3 -L1
-        -3 -3 -3 -3 -2 -1  1;  % m1=-L2:  -L3 -L3 -L3 -L3 -L2 -L1 +L1
-        -3 -3 -2 -2 -1 -1  1;  % m1=-L1:  -L3 -L3 -L2 -L2 -L1 -L1 +L1
-        -3 -3 -2 -1  0  0  1;  % m1=0:    -L3 -L3 -L2 -L1  0   0  +L1
-        -3 -2 -1  0  0  1  2;  % m1=+L1:  -L3 -L2 -L1  0   0  +L1 +L2
-        -3 -1 -1  0  1  1  3;  % m1=+L2:  -L3 -L1 -L1  0  +L1 +L1 +L3
-        -1  1  1  1  2  3  3   % m1=+L3:  -L1 +L1 +L1 +L1 +L2 +L3 +L3
-        ]);
-
+    off    = int16(4); %#ok<NASGU> % maps -3..3 -> 1..7
 
     % -------- quantize priors --------
-    % If you later want scaling, set cfg.prior_scale (e.g., 1/step) and do:
-    % yq = q7(round(priors(v)*cfg.prior_scale));
-    if ~isfield(cfg,'prior_scale'), cfg.prior_scale = 0.2; end
+    if ~isfield(cfg,'prior_scale'), cfg.prior_scale = 0.5; end
     yq = q7(round(priors * cfg.prior_scale));     % int8(N,1)
 
     % -------- message initialization --------
-    % store messages as int8 in {-3..3}
     for v = 1:N
         edges_v = G.vn_edge{v};
         G.v2c(edges_v) = yq(v);
@@ -123,26 +134,23 @@ function [hard_bits, success, iters, Lpost_out, state] = super_layered_decode_fa
                 msgs = int8(G.v2c(edges));               % int8
                 abs_msgs = abs(int16(msgs));             % int16 for safe abs
 
-                % min1/min2 and argmin
                 [min1, min_idx] = min(abs_msgs);
                 if numel(abs_msgs) >= 2
                     abs_msgs2 = abs_msgs;
                     abs_msgs2(min_idx) = intmax('int16');
                     min2 = min(abs_msgs2);
                 else
-                    min2 = intmax('int16'); % degree-1 CN case
+                    min2 = intmax('int16');
                 end
 
-                % sign product (with signnz: treat 0 as +)
                 sgn = ones(size(msgs),'int8');
                 sgn(msgs < 0) = int8(-1);
-                sign_prod = int8(prod(int16(sgn))); % safe multiply in int16 then cast
+                sign_prod = int8(prod(int16(sgn)));
 
                 if syndrome(c) ~= 0
                     sign_prod = -sign_prod;
                 end
 
-                % outgoing messages
                 for k = 1:numel(edges)
                     if k == min_idx
                         mag = min2;
@@ -156,12 +164,10 @@ function [hard_bits, success, iters, Lpost_out, state] = super_layered_decode_fa
                     end
                     out_sign = int16(sign_prod) * int16(self_sign);
 
-                    % beta_code support (quantized)
                     new_val = double(out_sign) * double(mag) * cfg.beta_code;
                     new_msg = q7(round(new_val));
 
                     old_msg = int8(G.c2v(edges(k)));
-
                     diff = abs(double(new_msg) - double(old_msg));
                     if diff > max_res
                         max_res = diff;
@@ -182,17 +188,16 @@ function [hard_bits, success, iters, Lpost_out, state] = super_layered_decode_fa
                 edges_v = G.vn_edge{v};
                 dv = numel(edges_v);
 
-                yv = yq(v); % int8, represents channel sign (+ or -)
+                yv = yq(v); % int8 in {-3..3}
 
                 if dv == 2
                     e1 = edges_v(1); e2 = edges_v(2);
                     m1 = int8(G.c2v(e1));
                     m2 = int8(G.c2v(e2));
 
-                    out1 = faid_vn_dv2(yv, m2); % msg on e1 uses other incoming m2
-                    out2 = faid_vn_dv2(yv, m1); % msg on e2 uses other incoming m1
+                    out1 = faid_vn_dv2_lut(yv, m2, lut.LUT2neg); % msg on e1 uses other incoming m2
+                    out2 = faid_vn_dv2_lut(yv, m1, lut.LUT2neg); % msg on e2 uses other incoming m1
 
-                    % optional damping (quantize after)
                     if cfg.layer_damping < 1.0
                         out1 = q7(round(cfg.layer_damping*double(out1) + (1.0-cfg.layer_damping)*double(G.v2c(e1))));
                         out2 = q7(round(cfg.layer_damping*double(out2) + (1.0-cfg.layer_damping)*double(G.v2c(e2))));
@@ -210,7 +215,7 @@ function [hard_bits, success, iters, Lpost_out, state] = super_layered_decode_fa
                         m1 = m(idx_other(1));
                         m2 = m(idx_other(2));
 
-                        out = faid_vn_dv3(yv, m1, m2, LUT3);
+                        out = faid_vn_dv3_lut(yv, m1, m2, lut.LUT3neg);
 
                         if cfg.layer_damping < 1.0
                             out = q7(round(cfg.layer_damping*double(out) + (1.0-cfg.layer_damping)*double(G.v2c(e(ii)))));
@@ -222,12 +227,11 @@ function [hard_bits, success, iters, Lpost_out, state] = super_layered_decode_fa
             end
         end
 
-
         % ---- hard decision + Lpost ----
         for v = 1:N
             edges_v = G.vn_edge{v};
             Lpost_q = int16(yq(v)) + sum(int16(G.c2v(edges_v)));
-            Lpost_out(v) = double(Lpost_q);          % still returning as double for compatibility
+            Lpost_out(v) = double(Lpost_q);
             hard_bits(v) = uint8(Lpost_q < 0);
         end
 
@@ -263,16 +267,14 @@ end
 % ================= helpers =================
 
 function cfg = apply_superlayered_defaults(cfg)
-    if ~isfield(cfg,'max_iter'),       cfg.max_iter = 50; end
+    if ~isfield(cfg,'max_iter'),       cfg.max_iter = 10; end
     if ~isfield(cfg,'beta_code'),      cfg.beta_code = 1.0; end
     if ~isfield(cfg,'Tmin'),           cfg.Tmin = 1.0; end
-    if ~isfield(cfg,'layer_damping'),  cfg.layer_damping = 1.0; end  % for FAID you might prefer 1.0 initially
-    if ~isfield(cfg,'enable_gumbel'),  cfg.enable_gumbel = false; end
+    if ~isfield(cfg,'layer_damping'),  cfg.layer_damping = 1.0; end
+    if ~isfield(cfg,'enable_gumbel'),  cfg.enable_gumbel = true; end
 end
 
 function xq = q7(x)
-% Quantize to 7 levels {-3,-2,-1,0,1,2,3}, output int8.
-% Accepts double/int16/int32; rounds if not integer.
     if ~isinteger(x)
         x = round(x);
     end
@@ -281,7 +283,6 @@ function xq = q7(x)
 end
 
 function touched = precompute_layer_vars(G, layers)
-% touched{l} contains unique VNs appearing in layer checks.
     N = G.N;
     L = numel(layers);
     touched = cell(L,1);
@@ -307,7 +308,6 @@ function touched = precompute_layer_vars(G, layers)
 end
 
 function order = update_layer_order(layer_max_residual, cfg, k, rng)
-% Same as your previous Gumbel-based layer shuffling.
     L = numel(layer_max_residual);
 
     pos = layer_max_residual(layer_max_residual > 0);
@@ -342,29 +342,23 @@ function order = update_layer_order(layer_max_residual, cfg, k, rng)
     order = perm(:).';
 end
 
-
-function out = faid_vn_dv2(y, m)
-% FAID_VN_DV2 for degree-2
-% This implementation respects the specific 'C' (magnitude) of the bit 'y'.
-% If y is L1 (+1), it adds 1. If y is L3 (+3), it adds 3.
-% If y is L0 (0), it adds 0.
-    
-    % Direct Linear Threshold: Q(m + y)
-    val = int16(y) + int16(m);
-    out = q7(val); 
+function out = faid_vn_dv2_lut(y, m, LUT2neg)
+% LUT2neg: 1x7 canonical for y<0, indexed by m=-3..3.
+    off = int16(4);
+    if y < 0
+        out = LUT2neg(int16(m) + off);
+    else
+        out = -LUT2neg(int16(-m) + off);
+    end
 end
 
-
-function out = faid_vn_dv3(y, m1, m2, LUT3neg)
-% y, m1, m2 are int8 in {-3..3}
-% LUT3neg is the Table-II LUT for -C
-
-    off = int16(4); % maps -3..3 -> 1..7
-
+function out = faid_vn_dv3_lut(y, m1, m2, LUT3neg)
+% LUT3neg: 7x7 canonical for y<0, indexed by m1,m2=-3..3.
+    off = int16(4);
     if y < 0
         out = LUT3neg(int16(m1)+off, int16(m2)+off);
     else
         out = -LUT3neg(int16(-m1)+off, int16(-m2)+off);
+        % (your convention: y>0 -> negate and index at (-m1,-m2))
     end
 end
-

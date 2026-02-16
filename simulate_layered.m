@@ -44,8 +44,8 @@ for i = 1 : length(TS)
         end
 
         syndrome = double(syn).';
-        % [~, success] = super_layered_decode(T, layers, syndrome, llrs);
-        [~, success] = super_layered_decode_faid(T, layers, syndrome, llrs);
+        [~, success] = super_layered_decode(T, layers, syndrome, llrs);
+        % [~, success] = super_layered_decode_faid(T, layers, syndrome, llrs);
         if ~success
             break;
         end

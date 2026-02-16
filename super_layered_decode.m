@@ -187,9 +187,7 @@ function [hard_bits, success, iters, Lpost_out, state] = super_layered_decode(G,
             return;
         end
 
-        if cfg.enable_gumbel
-            state.layer_order = update_layer_order(layer_max_residual, cfg, iter, state.rng);
-        end
+          state.layer_order = update_layer_order(layer_max_residual, cfg, iter, state.rng);
     end
 
     iters = cfg.max_iter;
@@ -204,7 +202,7 @@ function cfg = apply_superlayered_defaults(cfg)
     if ~isfield(cfg,'beta_code'),      cfg.beta_code = 1.0; end
     if ~isfield(cfg,'Tmin'),           cfg.Tmin = 1.0; end
     if ~isfield(cfg,'layer_damping'),  cfg.layer_damping = 0.9; end
-    if ~isfield(cfg,'enable_gumbel'),  cfg.enable_gumbel = true; end
+    if ~isfield(cfg,'enable_gumbel'),  cfg.enable_gumbel = false; end
 end
 
 function y = saturate(x, limit)
@@ -238,9 +236,13 @@ function touched = precompute_layer_vars(G, layers)
 end
 
 function order = update_layer_order(layer_max_residual, cfg, k, rng)
-% Port of updateLayerOrder(int k) in C++.
+% Residual-based ordering is ALWAYS applied.
+% If cfg.enable_gumbel == true, add Gumbel noise to randomize the order.
+
     L = numel(layer_max_residual);
 
+    % Temperature computation (only matters if enable_gumbel is true,
+    % but kept consistent with the C++ port)
     pos = layer_max_residual(layer_max_residual > 0);
     if isempty(pos)
         mean_pos = 0.0;
@@ -252,25 +254,38 @@ function order = update_layer_order(layer_max_residual, cfg, k, rng)
     Tk = max(mean_pos * cooling, cfg.Tmin);
     Tk = max(Tk, cfg.Tmin);
 
-    z = layer_max_residual / Tk;
-    max_z = max(z);
-    probs = exp(z - max_z);
-    sum_exp = sum(probs);
+    % Base deterministic score: residuals (descending)
+    base_score = layer_max_residual;
 
-    if sum_exp == 0 || isinf(sum_exp)
-        probs = ones(L,1) / L;
+    if cfg.enable_gumbel
+        % Convert residuals -> probabilities via softmax(residual/Tk)
+        z = layer_max_residual / Tk;
+        max_z = max(z);
+        probs = exp(z - max_z);
+        sum_exp = sum(probs);
+
+        if sum_exp == 0 || isinf(sum_exp) || any(isnan(probs))
+            probs = ones(L,1) / L;
+        else
+            probs = probs / sum_exp;
+        end
+
+        % Gumbel noise
+        u = rand(rng, L, 1);
+        u = max(u, eps);
+        u = min(u, 1 - eps);
+        g = -log(-log(u));
+
+        % Randomized score
+        score = log(probs + 1e-20) + g;
+
+        % Sort by randomized score
+        [~, perm] = sort(score, 'descend');
+        order = perm(:).';  % row vector
     else
-        probs = probs / sum_exp;
+        % Pure deterministic residual ordering
+        [~, perm] = sort(base_score, 'descend');
+        order = perm(:).';
     end
-
-    % Gumbel sampling + sorting by score
-    u = rand(rng, L, 1);
-    u = max(u, eps);
-    u = min(u, 1 - eps);
-    g = -log(-log(u)); % gumbel
-
-    score = log(probs + 1e-20) + g;
-
-    [~, perm] = sort(score, 'descend');
-    order = perm(:).'; % row vector of layer indices
 end
+
